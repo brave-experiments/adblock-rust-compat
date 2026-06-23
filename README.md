@@ -1,8 +1,7 @@
 # adblock-rust-compat-checker-cli
 
 A CLI that finds the rules in a filter list that relate to a given set of domains, and
-reports which ones [adblock-rust](https://github.com/brave/adblock-rust) actually
-supports.
+reports which ones [adblock-rust](https://github.com/brave/adblock-rust) supports.
 
 ## What "supported" means
 
