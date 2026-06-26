@@ -73,12 +73,41 @@ See `examples/`.
 | `--url URL` | Raw URL (repeatable) |
 | `--file PATH` | Local file (repeatable) |
 | `--domains LIST` | Comma-separated domains to match; omit to check every rule |
+| `--option NAME` | Keep only rules using this option/type (see below) |
+| `--rule '<rule>'` | Explain a single rule (type, support, options) and exit |
+| `--probe` | With `--rule`, test each network option in isolation and label it ok/unsupported |
 | `--markdown` | Emit a markdown report to stdout |
 | `--json` | Emit the full report as JSON to stdout |
 | `--show-supported` | Also list supported rules (text output only) |
 | `-h`, `--help` | Show help |
 
 The `--list`/`--url`/`--file` sources are combined; at least one is required.
+
+### Exploring by option
+
+Every rule has option/type tokens: a network rule's `$` modifiers (`script`,
+`third-party`, `domain`, `replace`, `redirect`, ...) or a cosmetic rule's type
+(`elemhide`, `scriptlet`, `style`, `remove`, `procedural`, `js`, `exception`). The
+`style`/`remove` actions cover both the uBO `:style()`/`:remove()` forms and the ABP
+`{css}`/`{remove: true;}` forms ([brave/adblock-rust#415][415]). Discover a rule's
+options, then find every rule that uses one across the lists:
+
+```sh
+# What options does this rule use? (--probe labels each as ok/unsupported)
+adblock-rust-compat --rule '||www.youtube.com/watch?$xhr,1p,replace=/"adPlacements"/"x"/' --probe
+#   Type: network / Supported: no (UnrecognisedOption)
+#   Options: xhr (ok), 1p (ok), replace (unsupported)
+
+# Every rule using $replace across uBO + EasyList + EasyPrivacy, with compat + source:
+adblock-rust-compat --list ubo,easylist,easyprivacy --option replace
+```
+
+`--option` composes with `--domains` (a rule must satisfy both). Option matching is on
+the name as written (e.g. `third-party`, not its `3p` alias). `--probe` exists because
+adblock-rust's `UnrecognisedOption` error doesn't say *which* option failed, so each
+network option is re-parsed in isolation to attribute the failure.
+
+[415]: https://github.com/brave/adblock-rust/issues/415
 
 Progress goes to stderr and the report to stdout, so
 `... --markdown > report.md` produces a clean file.
@@ -93,8 +122,8 @@ The default is a text summary plus the unsupported rules. `--markdown` adds a pr
 header (source, domain set, adblock-rust version, tool version) and Unsupported/Supported
 tables; its output is deterministic, so a committed report only changes when the rules or
 their support actually change. `--json` emits a single object with the same provenance
-(`adblock_version`, `tool`, `tool_version`, `source`, `domains`) plus a `rules` array,
-each entry carrying its rule text, `sources`, relations, support status, and reason.
+(`adblock_version`, `tool`, `tool_version`, `source`, `domains`, `option`) plus a `rules`
+array, each entry carrying its rule text, `sources`, relations, support status, and reason.
 
 When more than one source is combined, each rule records which list(s) it came from: a
 `sources` array in `--json` (always present), and a `Source` column (markdown) / `<src>`

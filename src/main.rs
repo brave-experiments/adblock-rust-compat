@@ -9,17 +9,20 @@
 //! is required; `--domains` is optional (omit to check every rule in the list).
 
 mod domains;
+mod options;
 mod resources;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use adblock::filters::network::NetworkFilterError;
 use adblock::lists::{
     parse_filter, FilterFormat, FilterParseError, ParseOptions, ParsedFilter, RuleTypes,
 };
 use adblock::resources::PermissionMask;
 
 use domains::{DomainMatcher, Relation};
+use options::rule_options;
 use resources::{ResourceChecker, ResourceStatus};
 
 /// adblock-rust version this tool is built against (keep in sync with Cargo.toml).
@@ -75,6 +78,8 @@ struct Report<'a> {
     tool_version: &'static str,
     source: String,
     domains: Option<Vec<String>>,
+    /// The `--option` filter, if any (only rules with this option are included).
+    option: Option<String>,
     rules: &'a [RuleReport],
 }
 
@@ -131,6 +136,7 @@ struct Source {
 fn collect_reports(
     sources: &[Source],
     matcher: Option<&DomainMatcher>,
+    option_filter: Option<&str>,
     resources: &ResourceChecker,
 ) -> Vec<RuleReport> {
     let mut reports: Vec<RuleReport> = Vec::new();
@@ -150,9 +156,16 @@ fn collect_reports(
                 }
                 continue;
             }
-            // Already seen and rejected (didn't match the domain filter): skip re-parsing.
+            // Already seen and rejected: skip re-checking.
             if seen_nonmatch.contains(rule) {
                 continue;
+            }
+            // Option filter is rule-intrinsic (textual), so check it before parsing.
+            if let Some(opt) = option_filter {
+                if !rule_options(rule).iter().any(|o| o == opt) {
+                    seen_nonmatch.insert(rule.to_string());
+                    continue;
+                }
             }
 
             let (parsed, filter_type, parse_error) = parse(rule);
@@ -227,6 +240,17 @@ fn main() {
             .collect()
     };
 
+    // `--rule '<rule>'`: explain a single rule (type, support, options) and exit.
+    // `--probe` additionally tests each network option in isolation.
+    if let Some(rule) = value_of("--rule") {
+        let probe = args.iter().any(|a| a == "--probe");
+        explain_rule(&rule, probe, &ResourceChecker::from_embedded());
+        return;
+    }
+
+    // `--option <name>`: keep only rules that use this option/type.
+    let option_filter = value_of("--option").map(|s| s.trim().to_ascii_lowercase());
+
     // Sources can be combined: any mix of --file, --list (preset/URL; comma-separated
     // and/or repeated), and --url (repeatable). Each keeps a short `name` (shown per-rule)
     // and a resolved `label` (shown in the report provenance).
@@ -291,10 +315,18 @@ fn main() {
         Some(d) => eprintln!("Matching domains: {}", d.join(", ")),
         None => eprintln!("No --domains given: checking all rules."),
     }
+    if let Some(opt) = &option_filter {
+        eprintln!("Filtering to rules with option: {opt}");
+    }
     let matcher = domains.as_ref().map(|d| DomainMatcher::new(d));
     let resource_checker = ResourceChecker::from_embedded();
 
-    let reports = collect_reports(&sources, matcher.as_ref(), &resource_checker);
+    let reports = collect_reports(
+        &sources,
+        matcher.as_ref(),
+        option_filter.as_deref(),
+        &resource_checker,
+    );
 
     if output_json {
         let report = Report {
@@ -303,6 +335,7 @@ fn main() {
             tool_version: env!("CARGO_PKG_VERSION"),
             source: source_label.clone(),
             domains: domains.clone(),
+            option: option_filter.clone(),
             rules: &reports,
         };
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -310,11 +343,76 @@ fn main() {
     }
 
     if output_markdown {
-        print_markdown(&reports, domains.as_deref(), &source_label, multi_source);
+        print_markdown(
+            &reports,
+            domains.as_deref(),
+            &source_label,
+            multi_source,
+            option_filter.as_deref(),
+        );
         return;
     }
 
     print_report(&reports, show_supported, domains.is_some(), multi_source);
+}
+
+/// Explain a single rule: its parsed type, whether adblock-rust supports it, and the
+/// option/type tokens it uses. With `probe`, each network option is tested in isolation
+/// and labelled `ok`/`unsupported` (adblock-rust's error doesn't say which option failed).
+fn explain_rule(rule: &str, probe: bool, resources: &ResourceChecker) {
+    let rule = rule.trim();
+    let (parsed, filter_type, parse_error) = parse(rule);
+    let (supported, reason) = support(rule, &parsed, parse_error, resources);
+    let opts = rule_options(rule);
+
+    println!("Rule:      {rule}");
+    println!("Type:      {}", filter_type.unwrap_or("unknown"));
+    if supported {
+        println!("Supported: yes");
+    } else {
+        println!("Supported: no ({})", reason.as_deref().unwrap_or("?"));
+    }
+
+    let options_line = if opts.is_empty() {
+        "(none)".to_string()
+    } else if probe && filter_type == Some("network") {
+        opts.iter()
+            .map(|o| {
+                let mark = if option_supported(o) {
+                    "ok"
+                } else {
+                    "unsupported"
+                };
+                format!("{o} ({mark})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        opts.join(", ")
+    };
+    println!("Options:   {options_line}");
+
+    if probe && filter_type != Some("network") {
+        println!("Note:      --probe applies to network $options; cosmetic types aren't probed.");
+    }
+}
+
+/// Is a network option recognised by adblock-rust? Probe it in isolation on a canonical
+/// rule. `UnrecognisedOption` (for both valueless and valued forms) means unsupported;
+/// any other outcome means the option is recognised (it may just need a valid value).
+fn option_supported(name: &str) -> bool {
+    let probes = [
+        format!("||example.com^${name}"),
+        format!("||example.com^${name}=example.com"),
+    ];
+    for probe in probes {
+        match parse_filter(&probe, false, parse_options()) {
+            Ok(_) => return true,
+            Err(FilterParseError::Network(NetworkFilterError::UnrecognisedOption)) => continue,
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn print_report(
@@ -412,6 +510,7 @@ fn print_markdown(
     domains: Option<&[String]>,
     source: &str,
     multi_source: bool,
+    option_filter: Option<&str>,
 ) {
     let supported = reports.iter().filter(|r| r.supported).count();
     let unsupported = reports.len() - supported;
@@ -427,6 +526,9 @@ fn print_markdown(
         None => "all (no domain filter)".to_string(),
     };
     println!("| Domains | {} |", md_text(&domains_label));
+    if let Some(opt) = option_filter {
+        println!("| Option | {} |", md_text(opt));
+    }
     println!("| adblock-rust | {ADBLOCK_RUST_VERSION} |");
     println!(
         "| Tool | {} v{} |",
@@ -546,7 +648,8 @@ fn print_usage() {
         "{name} v{version} - check which filter-list rules adblock-rust supports
 
 USAGE:
-    adblock-rust-compat <SOURCE>... [--domains LIST] [OPTIONS]
+    adblock-rust-compat <SOURCE>... [--domains LIST] [--option NAME] [OPTIONS]
+    adblock-rust-compat --rule '<rule>'
 
 SOURCE (one or more; their rules are combined and de-duplicated):
     --list NAMES|URLS    ubo, easylist, easyprivacy, or http(s) URLs; comma-separated
@@ -557,6 +660,12 @@ SOURCE (one or more; their rules are combined and de-duplicated):
 OPTIONS:
     --domains LIST       Comma-separated domains to match (e.g. youtube.com,youtu.be);
                          omit to check every rule in the list
+    --option NAME        Keep only rules using this option/type (network $modifier like
+                         replace, redirect, third-party; or cosmetic type like scriptlet,
+                         elemhide, procedural, style)
+    --rule '<rule>'      Explain a single rule (type, support, options) and exit
+    --probe              With --rule, test each network option in isolation and label it
+                         ok/unsupported (adblock-rust's error doesn't name the option)
     --markdown           Emit a markdown report to stdout
     --json               Emit the full report as JSON to stdout
     --show-supported     Also list supported rules (text output only)
@@ -564,6 +673,8 @@ OPTIONS:
 
 When --domains is given, list registrable domains (e.g. example.com) for broad subdomain
 coverage, plus any specific subdomains used in cosmetic/$domain= scopes.
+Discover a rule's options with --rule, then search for them with --option, e.g.
+    adblock-rust-compat --list ubo,easylist,easyprivacy --option replace
 See examples/check-youtube.sh for the YouTube domain set.",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
@@ -608,8 +719,8 @@ mod tests {
                 text: "||shared.com^\n||y.com^\n".into(),
             },
         ];
-        // No domain filter: every unique rule is kept.
-        let reports = collect_reports(&sources, None, &resources);
+        // No domain filter, no option filter: every unique rule is kept.
+        let reports = collect_reports(&sources, None, None, &resources);
         assert_eq!(reports.len(), 3);
 
         let shared = reports.iter().find(|r| r.rule == "||shared.com^").unwrap();
@@ -618,6 +729,33 @@ mod tests {
         assert_eq!(x.sources, vec!["a"]);
         let y = reports.iter().find(|r| r.rule == "||y.com^").unwrap();
         assert_eq!(y.sources, vec!["b"]);
+    }
+
+    #[test]
+    fn option_supported_classifies_network_options() {
+        // recognised options (valueless and value-taking)
+        assert!(option_supported("script"));
+        assert!(option_supported("third-party"));
+        assert!(option_supported("1p"));
+        assert!(option_supported("domain"));
+        assert!(option_supported("redirect"));
+        // unrecognised by adblock-rust
+        assert!(!option_supported("popup"));
+        assert!(!option_supported("replace"));
+        assert!(!option_supported("rewrite"));
+    }
+
+    #[test]
+    fn option_filter_keeps_only_matching_rules() {
+        let resources = ResourceChecker::from_embedded();
+        let sources = vec![Source {
+            name: "a".into(),
+            label: "a".into(),
+            text: "||a.com^$replace=/x/y/\n||b.com^$script\n||c.com^\nd.com##.ad\n".into(),
+        }];
+        let reports = collect_reports(&sources, None, Some("replace"), &resources);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].rule, "||a.com^$replace=/x/y/");
     }
 
     #[test]
