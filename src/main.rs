@@ -66,6 +66,11 @@ struct RuleReport {
     supported: bool,
     filter_type: Option<&'static str>,
     reason: Option<String>,
+    /// With `--probe`, what's unsupported about an unsupported rule: for a network rule,
+    /// the option(s) that fail in isolation; for a cosmetic rule, its type(s). Empty
+    /// (and omitted) without `--probe` or for supported rules.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unsupported_options: Vec<String>,
 }
 
 /// Top-level `--json` output: provenance (so downstream consumers don't have to restate
@@ -137,11 +142,14 @@ fn collect_reports(
     sources: &[Source],
     matcher: Option<&DomainMatcher>,
     option_filter: Option<&str>,
+    probe: bool,
     resources: &ResourceChecker,
 ) -> Vec<RuleReport> {
     let mut reports: Vec<RuleReport> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut seen_nonmatch: HashSet<String> = HashSet::new();
+    // Memoize per-option probe results so a shared option (e.g. `popup`) is tested once.
+    let mut option_cache: HashMap<String, bool> = HashMap::new();
 
     for src in sources {
         for line in src.text.lines() {
@@ -185,6 +193,26 @@ fn collect_reports(
             };
 
             let (supported, reason) = support(rule, &parsed, parse_error, resources);
+
+            // With --probe, attribute what's unsupported: network -> the option(s) that
+            // fail in isolation; cosmetic -> its type(s). Empty for supported rules.
+            let unsupported_options = if probe && !supported {
+                if filter_type == Some("network") {
+                    rule_options(rule)
+                        .into_iter()
+                        .filter(|o| {
+                            !*option_cache
+                                .entry(o.clone())
+                                .or_insert_with(|| option_supported(o))
+                        })
+                        .collect()
+                } else {
+                    rule_options(rule)
+                }
+            } else {
+                Vec::new()
+            };
+
             index.insert(rule.to_string(), reports.len());
             reports.push(RuleReport {
                 rule: rule.to_string(),
@@ -193,6 +221,7 @@ fn collect_reports(
                 supported,
                 filter_type,
                 reason,
+                unsupported_options,
             });
         }
     }
@@ -226,6 +255,7 @@ fn main() {
     let output_json = args.iter().any(|a| a == "--json");
     let output_markdown = args.iter().any(|a| a == "--markdown");
     let show_supported = args.iter().any(|a| a == "--show-supported");
+    let probe = args.iter().any(|a| a == "--probe");
     let value_of = |flag: &str| {
         args.iter()
             .position(|a| a == flag)
@@ -243,7 +273,6 @@ fn main() {
     // `--rule '<rule>'`: explain a single rule (type, support, options) and exit.
     // `--probe` additionally tests each network option in isolation.
     if let Some(rule) = value_of("--rule") {
-        let probe = args.iter().any(|a| a == "--probe");
         explain_rule(&rule, probe, &ResourceChecker::from_embedded());
         return;
     }
@@ -325,6 +354,7 @@ fn main() {
         &sources,
         matcher.as_ref(),
         option_filter.as_deref(),
+        probe,
         &resource_checker,
     );
 
@@ -664,8 +694,9 @@ OPTIONS:
                          replace, redirect, third-party; or cosmetic type like scriptlet,
                          elemhide, procedural, style)
     --rule '<rule>'      Explain a single rule (type, support, options) and exit
-    --probe              With --rule, test each network option in isolation and label it
-                         ok/unsupported (adblock-rust's error doesn't name the option)
+    --probe              Attribute what's unsupported. With --rule, label each network
+                         option ok/unsupported. With a --json scan, add an
+                         `unsupported_options` array to each unsupported rule.
     --markdown           Emit a markdown report to stdout
     --json               Emit the full report as JSON to stdout
     --show-supported     Also list supported rules (text output only)
@@ -720,7 +751,7 @@ mod tests {
             },
         ];
         // No domain filter, no option filter: every unique rule is kept.
-        let reports = collect_reports(&sources, None, None, &resources);
+        let reports = collect_reports(&sources, None, None, false, &resources);
         assert_eq!(reports.len(), 3);
 
         let shared = reports.iter().find(|r| r.rule == "||shared.com^").unwrap();
@@ -753,9 +784,45 @@ mod tests {
             label: "a".into(),
             text: "||a.com^$replace=/x/y/\n||b.com^$script\n||c.com^\nd.com##.ad\n".into(),
         }];
-        let reports = collect_reports(&sources, None, Some("replace"), &resources);
+        let reports = collect_reports(&sources, None, Some("replace"), false, &resources);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].rule, "||a.com^$replace=/x/y/");
+    }
+
+    #[test]
+    fn probe_populates_unsupported_options() {
+        let resources = ResourceChecker::from_embedded();
+        let sources = vec![Source {
+            name: "a".into(),
+            label: "a".into(),
+            text: "||a.com^$popup,domain=x.com\n||b.com^$script\nc.com##.x {color:red}\n".into(),
+        }];
+        let reports = collect_reports(&sources, None, None, true, &resources);
+
+        // unsupported network -> only the failing option (not `domain`)
+        let popup = reports.iter().find(|r| r.rule.contains("popup")).unwrap();
+        assert_eq!(popup.unsupported_options, vec!["popup"]);
+        // supported network -> empty
+        let script = reports
+            .iter()
+            .find(|r| r.rule == "||b.com^$script")
+            .unwrap();
+        assert!(script.unsupported_options.is_empty());
+        // unsupported cosmetic -> its type
+        let cosmetic = reports.iter().find(|r| r.rule.contains("##")).unwrap();
+        assert_eq!(cosmetic.unsupported_options, vec!["style"]);
+    }
+
+    #[test]
+    fn no_probe_leaves_unsupported_options_empty() {
+        let resources = ResourceChecker::from_embedded();
+        let sources = vec![Source {
+            name: "a".into(),
+            label: "a".into(),
+            text: "||a.com^$popup\n".into(),
+        }];
+        let reports = collect_reports(&sources, None, None, false, &resources);
+        assert!(reports[0].unsupported_options.is_empty());
     }
 
     #[test]

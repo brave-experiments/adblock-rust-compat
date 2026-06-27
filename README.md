@@ -75,7 +75,7 @@ See `examples/`.
 | `--domains LIST` | Comma-separated domains to match; omit to check every rule |
 | `--option NAME` | Keep only rules using this option/type (see below) |
 | `--rule '<rule>'` | Explain a single rule (type, support, options) and exit |
-| `--probe` | With `--rule`, test each network option in isolation and label it ok/unsupported |
+| `--probe` | With `--rule`, label each network option ok/unsupported; with a `--json` scan, add `unsupported_options` to each unsupported rule |
 | `--markdown` | Emit a markdown report to stdout |
 | `--json` | Emit the full report as JSON to stdout |
 | `--show-supported` | Also list supported rules (text output only) |
@@ -124,6 +124,12 @@ tables; its output is deterministic, so a committed report only changes when the
 their support actually change. `--json` emits a single object with the same provenance
 (`adblock_version`, `tool`, `tool_version`, `source`, `domains`, `option`) plus a `rules`
 array, each entry carrying its rule text, `sources`, relations, support status, and reason.
+
+Adding `--probe` to a `--json` scan attaches an `unsupported_options` array to each
+**unsupported** rule: for a network rule, the option(s) that fail in isolation (e.g.
+`["replace"]`); for a cosmetic rule, its type(s) (e.g. `["procedural"]`). Supported rules
+omit it, and without `--probe` it's absent entirely (so the default scan is unchanged).
+Only unsupported rules are probed, and per-option results are memoized, so the cost is small.
 
 When more than one source is combined, each rule records which list(s) it came from: a
 `sources` array in `--json` (always present), and a `Source` column (markdown) / `<src>`
