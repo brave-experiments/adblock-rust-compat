@@ -770,10 +770,11 @@ mod tests {
         assert!(option_supported("1p"));
         assert!(option_supported("domain"));
         assert!(option_supported("redirect"));
+        // `rewrite` is the ABP-syntax alias for `redirect`, recognised since adblock 0.12.6
+        assert!(option_supported("rewrite"));
         // unrecognised by adblock-rust
         assert!(!option_supported("popup"));
         assert!(!option_supported("replace"));
-        assert!(!option_supported("rewrite"));
     }
 
     #[test]
@@ -795,7 +796,7 @@ mod tests {
         let sources = vec![Source {
             name: "a".into(),
             label: "a".into(),
-            text: "||a.com^$popup,domain=x.com\n||b.com^$script\nc.com##.x {color:red}\n".into(),
+            text: "||a.com^$popup,domain=x.com\n||b.com^$script\nc.com#$#.x {color:red}\n".into(),
         }];
         let reports = collect_reports(&sources, None, None, true, &resources);
 
@@ -809,7 +810,7 @@ mod tests {
             .unwrap();
         assert!(script.unsupported_options.is_empty());
         // unsupported cosmetic -> its type
-        let cosmetic = reports.iter().find(|r| r.rule.contains("##")).unwrap();
+        let cosmetic = reports.iter().find(|r| r.rule.contains("#$#")).unwrap();
         assert_eq!(cosmetic.unsupported_options, vec!["style"]);
     }
 

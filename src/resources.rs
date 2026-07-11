@@ -47,10 +47,21 @@ impl ResourceChecker {
             }
             ParsedFilter::Network(n) if n.mask.contains(NetworkFilterMask::IS_REDIRECT) => {
                 match n.modifier_option.as_deref() {
-                    // strip any `:priority` suffix; resource names contain no colon
+                    // Try the value as-is first (handles `abp-resource:NAME` aliases, whose
+                    // names legitimately contain a colon), then fall back to stripping a
+                    // purely-numeric trailing `:priority` suffix (handles `noopjs:5`).
                     Some(value) => {
-                        let name = value.split(':').next().unwrap_or(value);
-                        if self.storage.get_redirect_resource(name).is_some() {
+                        let stripped = match value.rsplit_once(':') {
+                            Some((head, prio))
+                                if !prio.is_empty() && prio.bytes().all(|b| b.is_ascii_digit()) =>
+                            {
+                                head
+                            }
+                            _ => value,
+                        };
+                        if self.storage.get_redirect_resource(value).is_some()
+                            || self.storage.get_redirect_resource(stripped).is_some()
+                        {
                             ResourceStatus::Ok
                         } else {
                             ResourceStatus::Missing
@@ -141,6 +152,21 @@ mod tests {
             status("||youtube.com/get_video$media,redirect=noopmp4-1s"),
             ResourceStatus::Ok
         );
+    }
+
+    #[test]
+    fn abp_resource_redirect_resolves() {
+        // `abp-resource:NAME` is an alias kept verbatim by adblock-rust; the colon is part
+        // of the name and must not be stripped before the resource lookup.
+        assert_eq!(
+            status("||googlevideo.com/videoplayback?$rewrite=abp-resource:blank-mp4"),
+            ResourceStatus::Ok
+        );
+    }
+
+    #[test]
+    fn redirect_with_numeric_priority_resolves() {
+        assert_eq!(status("||x.com^$redirect=noopjs:5"), ResourceStatus::Ok);
     }
 
     #[test]
