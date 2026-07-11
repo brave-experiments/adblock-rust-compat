@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use adblock::filters::cosmetic::CosmeticFilter;
 use adblock::filters::network::NetworkFilter;
-use adblock::lists::ParsedFilter;
+use adblock::lists::ParsedLine;
 use adblock::utils::{fast_hash, Hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -77,10 +77,10 @@ impl DomainMatcher {
             .unwrap_or(false)
     }
 
-    pub fn relations_parsed(&self, parsed: &ParsedFilter) -> Vec<Relation> {
+    pub fn relations_parsed(&self, parsed: &ParsedLine) -> Vec<Relation> {
         match parsed {
-            ParsedFilter::Network(f) => self.relations_network(f),
-            ParsedFilter::Cosmetic(f) => self.relations_cosmetic(f),
+            ParsedLine::Network(f) => self.relations_network(f),
+            ParsedLine::Cosmetic(f) => self.relations_cosmetic(f),
         }
     }
 
@@ -240,7 +240,7 @@ mod tests {
         DomainMatcher::new(YT)
     }
 
-    fn parse(rule: &str) -> ParsedFilter {
+    fn parse(rule: &str) -> ParsedLine<'_> {
         parse_filter(
             rule,
             true,

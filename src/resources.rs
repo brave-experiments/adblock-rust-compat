@@ -4,8 +4,7 @@
 //! `.js` suffixing, aliases, dependencies, and permissions match the engine.
 
 use adblock::filters::cosmetic::CosmeticFilterMask;
-use adblock::filters::network::NetworkFilterMask;
-use adblock::lists::ParsedFilter;
+use adblock::lists::ParsedLine;
 use adblock::resources::{InMemoryResourceStorage, PermissionMask, Resource, ResourceStorage};
 
 const BRAVE_RESOURCES_JSON: &str = include_str!("../data/brave-resources.json");
@@ -37,16 +36,16 @@ impl ResourceChecker {
 
     /// `rule` is the original text; `parsed` is its parse tree, used to tell scriptlet
     /// and redirect rules apart from rules that merely mention `+js(`/`redirect=`.
-    pub fn check_rule(&self, parsed: &ParsedFilter, rule: &str) -> ResourceStatus {
+    pub fn check_rule(&self, parsed: &ParsedLine, rule: &str) -> ResourceStatus {
         match parsed {
-            ParsedFilter::Cosmetic(c) if c.mask.contains(CosmeticFilterMask::SCRIPT_INJECT) => {
+            ParsedLine::Cosmetic(c) if c.mask.contains(CosmeticFilterMask::SCRIPT_INJECT) => {
                 match scriptlet_body(rule) {
                     Some(body) => self.check_scriptlet(body),
                     None => ResourceStatus::NotApplicable,
                 }
             }
-            ParsedFilter::Network(n) if n.mask.contains(NetworkFilterMask::IS_REDIRECT) => {
-                match n.modifier_option.as_deref() {
+            ParsedLine::Network(n) if n.is_redirect() => {
+                match n.modifier_option {
                     // strip any `:priority` suffix; resource names contain no colon
                     Some(value) => {
                         let name = value.split(':').next().unwrap_or(value);

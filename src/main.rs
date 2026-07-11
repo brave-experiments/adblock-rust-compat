@@ -17,7 +17,7 @@ use std::io::Read;
 
 use adblock::filters::network::NetworkFilterError;
 use adblock::lists::{
-    parse_filter, FilterFormat, FilterParseError, ParseOptions, ParsedFilter, RuleTypes,
+    parse_filter, FilterFormat, FilterParseError, ParseOptions, ParsedLine, RuleTypes,
 };
 use adblock::resources::PermissionMask;
 
@@ -26,7 +26,7 @@ use options::rule_options;
 use resources::{ResourceChecker, ResourceStatus};
 
 /// adblock-rust version this tool is built against (keep in sync with Cargo.toml).
-const ADBLOCK_RUST_VERSION: &str = "0.12.x";
+const ADBLOCK_RUST_VERSION: &str = "0.13.x";
 
 const UBO_URL: &str =
     "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt";
@@ -96,20 +96,23 @@ fn parse_options() -> ParseOptions {
     }
 }
 
-fn parse(rule: &str) -> (Option<ParsedFilter>, Option<&'static str>, Option<String>) {
+fn parse(rule: &str) -> (Option<ParsedLine<'_>>, Option<&'static str>, Option<String>) {
     match parse_filter(rule, true, parse_options()) {
-        Ok(p @ ParsedFilter::Network(_)) => (Some(p), Some("network"), None),
-        Ok(p @ ParsedFilter::Cosmetic(_)) => (Some(p), Some("cosmetic"), None),
+        Ok(p @ ParsedLine::Network(_)) => (Some(p), Some("network"), None),
+        Ok(p @ ParsedLine::Cosmetic(_)) => (Some(p), Some("cosmetic"), None),
         Err(FilterParseError::Network(e)) => (None, Some("network"), Some(format!("{e:?}"))),
         Err(FilterParseError::Cosmetic(e)) => (None, Some("cosmetic"), Some(format!("{e:?}"))),
         Err(FilterParseError::Unsupported) => (None, None, Some("unsupported".into())),
         Err(FilterParseError::Empty) => (None, None, Some("empty".into())),
+        Err(FilterParseError::InvalidExpiresInterval) => {
+            (None, None, Some("invalid expires interval".into()))
+        }
     }
 }
 
 fn support(
     rule: &str,
-    parsed: &Option<ParsedFilter>,
+    parsed: &Option<ParsedLine>,
     parse_error: Option<String>,
     resources: &ResourceChecker,
 ) -> (bool, Option<String>) {
@@ -770,10 +773,11 @@ mod tests {
         assert!(option_supported("1p"));
         assert!(option_supported("domain"));
         assert!(option_supported("redirect"));
+        // `rewrite` is the ABP-syntax alias for `redirect`, recognised since adblock 0.13
+        assert!(option_supported("rewrite"));
         // unrecognised by adblock-rust
         assert!(!option_supported("popup"));
         assert!(!option_supported("replace"));
-        assert!(!option_supported("rewrite"));
     }
 
     #[test]
@@ -795,7 +799,7 @@ mod tests {
         let sources = vec![Source {
             name: "a".into(),
             label: "a".into(),
-            text: "||a.com^$popup,domain=x.com\n||b.com^$script\nc.com##.x {color:red}\n".into(),
+            text: "||a.com^$popup,domain=x.com\n||b.com^$script\nc.com#$#.x {color:red}\n".into(),
         }];
         let reports = collect_reports(&sources, None, None, true, &resources);
 
@@ -809,7 +813,7 @@ mod tests {
             .unwrap();
         assert!(script.unsupported_options.is_empty());
         // unsupported cosmetic -> its type
-        let cosmetic = reports.iter().find(|r| r.rule.contains("##")).unwrap();
+        let cosmetic = reports.iter().find(|r| r.rule.contains("#$#")).unwrap();
         assert_eq!(cosmetic.unsupported_options, vec!["style"]);
     }
 
