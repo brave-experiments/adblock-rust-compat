@@ -10,6 +10,7 @@
 
 mod domains;
 mod options;
+mod regexcheck;
 mod resources;
 
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,7 @@ use adblock::resources::PermissionMask;
 
 use domains::{DomainMatcher, Relation};
 use options::rule_options;
+use regexcheck::RegexCheck;
 use resources::{ResourceChecker, ResourceStatus};
 
 /// adblock-rust version this tool is built against (keep in sync with Cargo.toml).
@@ -66,6 +68,11 @@ struct RuleReport {
     supported: bool,
     filter_type: Option<&'static str>,
     reason: Option<String>,
+    /// For an unsupported full-regex rule, the syntax features adblock-rust can't compile
+    /// (e.g. `["lookahead"]`); empty (and omitted) otherwise. Also drives the per-feature
+    /// unsupported-regex counts in the summaries.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    regex_features: Vec<&'static str>,
     /// With `--probe`, what's unsupported about an unsupported rule: for a network rule,
     /// the option(s) that fail in isolation; for a cosmetic rule, its type(s). Empty
     /// (and omitted) without `--probe` or for supported rules.
@@ -112,14 +119,42 @@ fn support(
     parsed: &Option<ParsedFilter>,
     parse_error: Option<String>,
     resources: &ResourceChecker,
-) -> (bool, Option<String>) {
+) -> (bool, Option<String>, Vec<&'static str>) {
     let Some(parsed) = parsed else {
-        return (false, parse_error);
+        return (false, parse_error, Vec::new());
     };
+    // Full-regex rules: adblock-rust compiles the pattern lazily at match time and
+    // silently never matches when the `regex` crate rejects it (e.g. lookaheads,
+    // brave/adblock-rust#672). Check the same compile eagerly and report the rule
+    // unsupported; the features take precedence over a resource failure since a rule
+    // that can never match is the more fundamental problem.
+    if let ParsedFilter::Network(nf) = parsed {
+        if let Some(source) = regexcheck::regex_source(nf) {
+            let RegexCheck {
+                supported,
+                features,
+            } = regexcheck::check(&source);
+            if !supported {
+                return (
+                    false,
+                    Some(format!(
+                        "{} ({})",
+                        regexcheck::REASON_PREFIX,
+                        features.join(", ")
+                    )),
+                    features,
+                );
+            }
+        }
+    }
     match resources.check_rule(parsed, rule) {
-        ResourceStatus::NotApplicable | ResourceStatus::Ok => (true, None),
-        ResourceStatus::Missing => (false, Some("resource missing".into())),
-        ResourceStatus::RequiresPermission => (false, Some("resource requires permission".into())),
+        ResourceStatus::NotApplicable | ResourceStatus::Ok => (true, None, Vec::new()),
+        ResourceStatus::Missing => (false, Some("resource missing".into()), Vec::new()),
+        ResourceStatus::RequiresPermission => (
+            false,
+            Some("resource requires permission".into()),
+            Vec::new(),
+        ),
     }
 }
 
@@ -192,7 +227,8 @@ fn collect_reports(
                 None => Vec::new(),
             };
 
-            let (supported, reason) = support(rule, &parsed, parse_error, resources);
+            let (supported, reason, regex_features) =
+                support(rule, &parsed, parse_error, resources);
 
             // With --probe, attribute what's unsupported: network -> the option(s) that
             // fail in isolation; cosmetic -> its type(s). Empty for supported rules.
@@ -221,6 +257,7 @@ fn collect_reports(
                 supported,
                 filter_type,
                 reason,
+                regex_features,
                 unsupported_options,
             });
         }
@@ -392,7 +429,7 @@ fn main() {
 fn explain_rule(rule: &str, probe: bool, resources: &ResourceChecker) {
     let rule = rule.trim();
     let (parsed, filter_type, parse_error) = parse(rule);
-    let (supported, reason) = support(rule, &parsed, parse_error, resources);
+    let (supported, reason, _regex_features) = support(rule, &parsed, parse_error, resources);
     let opts = rule_options(rule);
 
     println!("Rule:      {rule}");
@@ -401,6 +438,18 @@ fn explain_rule(rule: &str, probe: bool, resources: &ResourceChecker) {
         println!("Supported: yes");
     } else {
         println!("Supported: no ({})", reason.as_deref().unwrap_or("?"));
+    }
+    // For full-regex rules, show whether the regex itself can compile (a rule can parse
+    // yet silently never match, e.g. when the pattern uses a lookahead).
+    if let Some(ParsedFilter::Network(nf)) = &parsed {
+        if let Some(source) = regexcheck::regex_source(nf) {
+            let check = regexcheck::check(&source);
+            if check.supported {
+                println!("Regex:     ok");
+            } else {
+                println!("Regex:     unsupported ({})", check.features.join(", "));
+            }
+        }
     }
 
     let options_line = if opts.is_empty() {
@@ -445,6 +494,35 @@ fn option_supported(name: &str) -> bool {
     false
 }
 
+/// Tally rules unsupported because their regex can't compile, with a per-feature breakdown
+/// (each feature counted once per rule, most frequent first). `None` when there are none.
+fn regex_summary(reports: &[RuleReport]) -> Option<(usize, String)> {
+    let mut feature_counts: Vec<(&str, usize)> = Vec::new();
+    let mut count = 0;
+    for r in reports.iter().filter(|r| !r.supported) {
+        if r.regex_features.is_empty() {
+            continue;
+        }
+        count += 1;
+        for feature in &r.regex_features {
+            match feature_counts.iter_mut().find(|(f, _)| f == feature) {
+                Some((_, c)) => *c += 1,
+                None => feature_counts.push((feature, 1)),
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    feature_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let detail = feature_counts
+        .iter()
+        .map(|(f, c)| format!("{f}: {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((count, detail))
+}
+
 fn print_report(
     reports: &[RuleReport],
     show_supported: bool,
@@ -472,6 +550,9 @@ fn print_report(
     }
     println!("Supported:      {supported}");
     println!("Unsupported:    {unsupported}");
+    if let Some((count, detail)) = regex_summary(reports) {
+        println!("  unsupported regex: {count} ({detail})");
+    }
 
     let mut unsupported_rules: Vec<&RuleReport> = reports.iter().filter(|r| !r.supported).collect();
     unsupported_rules
@@ -586,6 +667,9 @@ fn print_markdown(
             "**{} rules checked** - {supported} supported, {unsupported} unsupported.\n",
             reports.len()
         );
+    }
+    if let Some((count, detail)) = regex_summary(reports) {
+        println!("Unsupported regexes: **{count}** ({detail}).\n");
     }
 
     let mut unsupported_rules: Vec<&RuleReport> = reports.iter().filter(|r| !r.supported).collect();
@@ -880,9 +964,10 @@ mod tests {
         let rule = "youtube.com##+js(this-scriptlet-does-not-exist-xyz)";
         let (parsed, _ty, parse_error) = parse(rule);
         assert!(parsed.is_some(), "rule should parse");
-        let (supported, reason) = support(rule, &parsed, parse_error, &resources);
+        let (supported, reason, regex_features) = support(rule, &parsed, parse_error, &resources);
         assert!(!supported);
         assert_eq!(reason.as_deref(), Some("resource missing"));
+        assert!(regex_features.is_empty());
     }
 
     #[test]
@@ -890,9 +975,10 @@ mod tests {
         let resources = ResourceChecker::from_embedded();
         let rule = "youtube.com##+js(set, foo, 1)";
         let (parsed, _ty, parse_error) = parse(rule);
-        let (supported, reason) = support(rule, &parsed, parse_error, &resources);
+        let (supported, reason, regex_features) = support(rule, &parsed, parse_error, &resources);
         assert!(supported);
         assert!(reason.is_none());
+        assert!(regex_features.is_empty());
     }
 
     #[test]
@@ -901,5 +987,73 @@ mod tests {
         assert!(!is_filter_line("[Adblock Plus 2.0]"));
         assert!(!is_filter_line(""));
         assert!(is_filter_line("||youtube.com^"));
+    }
+
+    #[test]
+    fn lookahead_regex_rule_is_unsupported() {
+        // brave/adblock-rust#672: parses, but the regex can never compile (lookahead)
+        let rule = r#"/^https?:\/\/(?:[a-z]{2}\.)?[0-9a-z]{5,16}\.[a-z]{3,7}\/[a-z](?=[a-z]{0,25}[0-9A-Z])[0-9a-zA-Z]{3,26}\/\d{3,6}(?:[?&][_a-z0-9]+=[-0-9a-zA-Z]+)*$/$script,3p,redirect-rule=noop.js,match-case"#;
+        let (parsed, ty, parse_error) = parse(rule);
+        assert!(parsed.is_some(), "the rule parses cleanly");
+        assert_eq!(ty, Some("network"));
+        let resources = ResourceChecker::from_embedded();
+        let (supported, reason, regex_features) = support(rule, &parsed, parse_error, &resources);
+        assert!(!supported);
+        assert_eq!(reason.as_deref(), Some("unsupported regex (lookahead)"));
+        assert_eq!(regex_features, vec!["lookahead"]);
+    }
+
+    #[test]
+    fn plain_full_regex_rule_is_supported() {
+        let rule = r"/^https:\/\/f\.vimeocdn.*/$script,3p";
+        let (parsed, _ty, parse_error) = parse(rule);
+        assert!(parsed.is_some());
+        let resources = ResourceChecker::from_embedded();
+        let (supported, reason, regex_features) = support(rule, &parsed, parse_error, &resources);
+        assert!(supported);
+        assert!(reason.is_none());
+        assert!(regex_features.is_empty());
+    }
+
+    #[test]
+    fn backreference_regex_rule_is_unsupported() {
+        let rule = r"/a(b)\1/$script";
+        let (parsed, _ty, parse_error) = parse(rule);
+        assert!(parsed.is_some());
+        let resources = ResourceChecker::from_embedded();
+        let (supported, reason, regex_features) = support(rule, &parsed, parse_error, &resources);
+        assert!(!supported);
+        assert_eq!(reason.as_deref(), Some("unsupported regex (backreference)"));
+        assert_eq!(regex_features, vec!["backreference"]);
+    }
+
+    #[test]
+    fn regex_features_in_json_and_summary() {
+        let resources = ResourceChecker::from_embedded();
+        let sources = vec![Source {
+            name: "a".into(),
+            label: "a".into(),
+            text: format!("{}\n||ok.com^$script\n", r"/(?=x)/$script"),
+        }];
+        let reports = collect_reports(&sources, None, None, false, &resources);
+        assert_eq!(reports.len(), 2);
+
+        let lookahead = reports.iter().find(|r| r.rule.contains("(?=x)")).unwrap();
+        assert!(!lookahead.supported);
+        assert_eq!(lookahead.regex_features, vec!["lookahead"]);
+        // summary breakdown counts and classifies the regex failure
+        assert_eq!(
+            regex_summary(&reports),
+            Some((1, "lookahead: 1".to_string()))
+        );
+        // supported rules carry no features
+        let ok = reports
+            .iter()
+            .find(|r| r.rule == "||ok.com^$script")
+            .unwrap();
+        assert!(ok.supported);
+        assert!(ok.regex_features.is_empty());
+        // no regex failures -> no summary line
+        assert_eq!(regex_summary(&reports[1..]), None);
     }
 }

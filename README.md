@@ -13,8 +13,15 @@ A rule is reported as **supported** only if adblock-rust both:
    adblock-rust's resource set.
 
 Otherwise it is **unsupported**, with a single reason: a parse error (e.g.
-`UnrecognisedOption` for `$replace=`/`$denyallow=`) or a resource one
-(`resource missing` / `resource requires permission`).
+`UnrecognisedOption` for `$replace=`/`$denyallow=`), a resource one
+(`resource missing` / `resource requires permission`), or an unsupported regex.
+
+Unsupported regex: adblock-rust parses full-regex rules (`/pattern/`) without compiling the
+pattern - the regex is built lazily at match time, and a rule whose regex the `regex`
+crate rejects **silently never matches**. The tool therefore compiles the extracted
+pattern eagerly (mirroring adblock-rust's own compile) and reports such rules as
+`unsupported regex (lookahead)`, classifying the offending feature (lookahead, negative
+lookahead, lookbehind, negative lookbehind, backreference).
 
 This matters because a rule can parse cleanly and still do nothing, e.g. a
 `##+js(some-scriptlet)` whose scriptlet adblock-rust doesn't ship. Resource resolution
@@ -98,6 +105,11 @@ adblock-rust-compat --rule '||www.youtube.com/watch?$xhr,1p,replace=/"adPlacemen
 #   Type: network / Supported: no (UnrecognisedOption)
 #   Options: xhr (ok), 1p (ok), replace (unsupported)
 
+# Full-regex rules additionally show whether the regex can compile:
+adblock-rust-compat --rule '/a(?=b)/$script'
+#   Supported: no (unsupported regex (lookahead))
+#   Regex:     unsupported (lookahead)
+
 # Every rule using $replace across uBO + EasyList + EasyPrivacy, with compat + source:
 adblock-rust-compat --list ubo,easylist,easyprivacy --option replace
 ```
@@ -146,6 +158,8 @@ Source layout:
 
 - `src/main.rs` - CLI, pipeline, and text/markdown/JSON reporting
 - `src/domains.rs` - `DomainMatcher`: target/scope matching against a domain set
+- `src/regexcheck.rs` - full-regex validation against the `regex` crate (mirrors
+  adblock-rust's lazy compile, done eagerly instead)
 - `src/resources.rs` - scriptlet/redirect resource resolution
 - `data/brave-resources.json` - vendored Brave resource set (embedded at build time)
 
